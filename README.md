@@ -7,6 +7,7 @@ A Streamlit application for monthly attendance processing, payroll calculation, 
 - Upload one Excel workbook containing attendance and salary data.
 - Normalise `HH.MM`, standard Excel time, and text time values.
 - Apply documented late-mark, half-day, early-leave, overtime, and salary rules.
+- Review a daily operations dashboard, monthly attendance trends, payroll costs, employee risk signals, and a prioritised HR action queue.
 - Review record-level validation exceptions before finalising payroll.
 - Download a payroll workbook and individual PDF salary slips.
 

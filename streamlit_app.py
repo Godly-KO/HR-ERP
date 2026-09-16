@@ -25,6 +25,44 @@ def money_columns(frame: pd.DataFrame) -> dict[str, st.column_config.NumberColum
     return {name: st.column_config.NumberColumn(name, format="₹%d") for name in names if name in frame.columns}
 
 
+def build_action_queue(daily: pd.DataFrame, payroll: pd.DataFrame) -> pd.DataFrame:
+    """Build a small, action-oriented queue rather than another raw exception table."""
+    actions: list[dict[str, str | int]] = []
+    invalid = daily[daily["Status"] == "Needs review"]
+    if not invalid.empty:
+        actions.append({
+            "Priority": "Critical",
+            "Action": "Correct missing or invalid punches",
+            "Affected employees": int(invalid["Employee ID"].nunique()),
+            "Details": f"{len(invalid)} attendance record(s) are excluded from automated rules.",
+        })
+    duplicates = daily[daily.duplicated(["Employee ID", "Date"], keep=False)]
+    if not duplicates.empty:
+        actions.append({
+            "Priority": "Warning",
+            "Action": "Resolve duplicate attendance records",
+            "Affected employees": int(duplicates["Employee ID"].nunique()),
+            "Details": f"{len(duplicates)} duplicate row(s) need verification.",
+        })
+    review_count = int((payroll["Payroll Status"] == "Needs review").sum())
+    if review_count:
+        actions.append({
+            "Priority": "Warning",
+            "Action": "Review affected payrolls",
+            "Affected employees": review_count,
+            "Details": "Resolve attendance exceptions before approving payment.",
+        })
+    ready_count = int((payroll["Payroll Status"] == "Ready").sum())
+    if ready_count:
+        actions.append({
+            "Priority": "Ready",
+            "Action": "Approve ready payrolls and issue payslips",
+            "Affected employees": ready_count,
+            "Details": "Salary slips can be generated from the Payslips tab after approval.",
+        })
+    return pd.DataFrame(actions)
+
+
 st.title("HR ERP")
 st.caption("Attendance-led monthly payroll and salary-slip generation")
 
@@ -62,7 +100,102 @@ if daily.empty or payroll.empty:
 
 valid_dates = [value for value in daily["Date"].dropna()]
 pay_period = pd.Timestamp(max(valid_dates)).strftime("%B %Y") if valid_dates else "Current period"
-overview, employees, quality, payslips = st.tabs(["Payroll overview", "Employee details", "Data quality", "Payslips"])
+dashboard, overview, employees, quality, payslips = st.tabs(["Dashboard", "Payroll overview", "Employee details", "Data quality", "Payslips"])
+
+with dashboard:
+    latest_date = max(valid_dates)
+    latest_day = daily[daily["Date"] == latest_date].copy()
+    roster_size = len(payroll)
+    recorded_employee_count = latest_day["Employee ID"].nunique()
+    attendance_rate = (recorded_employee_count / roster_size * 100) if roster_size else 0
+    daily_late = int(latest_day["Late Mark"].sum())
+    daily_half = int(latest_day["Half Day"].sum())
+    daily_early = int(latest_day["Early Leave"].sum())
+    daily_review = int((latest_day["Status"] == "Needs review").sum())
+    daily_ot = int((latest_day["OT Days"] > 0).sum())
+
+    st.subheader(f"Daily operations - {pd.Timestamp(latest_date).strftime('%d %b %Y')}")
+    st.caption("The latest attendance date in the uploaded workbook. Attendance rate measures recorded employees against the payroll roster.")
+    metrics = st.columns(6)
+    metrics[0].metric("Recorded", f"{recorded_employee_count}/{roster_size}", f"{attendance_rate:.0f}%")
+    metrics[1].metric("Late arrivals", daily_late)
+    metrics[2].metric("Half days", daily_half)
+    metrics[3].metric("Early leaves", daily_early)
+    metrics[4].metric("Needs review", daily_review)
+    metrics[5].metric("OT eligible", daily_ot)
+
+    st.subheader("Daily exceptions")
+    daily_exceptions = latest_day[
+        (latest_day["Late Trigger"])
+        | (latest_day["Half Day"])
+        | (latest_day["Early Leave"])
+        | (latest_day["OT Days"] > 0)
+        | (latest_day["Status"] == "Needs review")
+    ]
+    if daily_exceptions.empty:
+        st.success("No attendance exceptions for the latest uploaded day.")
+    else:
+        st.dataframe(
+            daily_exceptions[["Employee ID", "Employee Name", "Punch In", "Punch Out", "Late Mark", "Half Day", "Early Leave", "OT Days", "Status", "Validation Notes"]],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    st.subheader("Monthly attendance trends")
+    daily_trends = daily.groupby("Date", as_index=False).agg(
+        **{
+            "Recorded attendance": ("Employee ID", "nunique"),
+            "Late marks": ("Late Mark", "sum"),
+            "Half days": ("Half Day", "sum"),
+            "Early leaves": ("Early Leave", "sum"),
+            "Records needing review": ("Status", lambda values: (values == "Needs review").sum()),
+        }
+    ).sort_values("Date")
+    trend_left, trend_right = st.columns(2)
+    with trend_left:
+        st.caption("Recorded attendance and exceptions by date")
+        st.line_chart(daily_trends.set_index("Date")[["Recorded attendance", "Late marks", "Half days", "Early leaves"]])
+    with trend_right:
+        st.caption("Records requiring HR review")
+        st.bar_chart(daily_trends.set_index("Date")[["Records needing review"]])
+
+    st.subheader("Monthly payroll overview")
+    payroll_metrics = st.columns(4)
+    payroll_metrics[0].metric("Base payroll", currency(payroll["Monthly Salary"].sum()))
+    payroll_metrics[1].metric("Deductions", currency(payroll["Total Deductions"].sum()))
+    payroll_metrics[2].metric("OT cost", currency(payroll["OT Pay"].sum()))
+    payroll_metrics[3].metric("Final payable", currency(payroll["Payable Salary"].sum()))
+    payroll_chart = payroll[["Employee Name", "Monthly Salary", "Total Deductions", "OT Pay", "Payable Salary"]].set_index("Employee Name")
+    st.bar_chart(payroll_chart)
+
+    insight_left, insight_right = st.columns(2)
+    with insight_left:
+        st.subheader("Employee insights")
+        top_ot = payroll[payroll["OT Days"] > 0].sort_values(["OT Pay", "OT Days"], ascending=False)
+        if top_ot.empty:
+            st.info("No employee earned overtime in this upload.")
+        else:
+            st.caption("Highest overtime earners")
+            st.dataframe(top_ot[["Employee ID", "Employee Name", "OT Days", "OT Pay"]].head(10), use_container_width=True, hide_index=True, column_config=money_columns(top_ot))
+        late_risk = payroll[payroll["Late Marks"] >= LATE_MARK_LIMIT - 1].sort_values("Late Marks", ascending=False)
+        if not late_risk.empty:
+            st.caption("Employees nearing or exceeding the late-mark allowance")
+            st.dataframe(late_risk[["Employee ID", "Employee Name", "Late Marks", "Excess Late Marks"]], use_container_width=True, hide_index=True)
+    with insight_right:
+        st.subheader("Repeated attendance issues")
+        repeat_issues = daily[daily["Status"] == "Needs review"].groupby(["Employee ID", "Employee Name"], as_index=False).size().rename(columns={"size": "Missing or invalid punches"}).sort_values("Missing or invalid punches", ascending=False)
+        if repeat_issues.empty:
+            st.success("No missing or invalid punches in this upload.")
+        else:
+            st.dataframe(repeat_issues, use_container_width=True, hide_index=True)
+        st.caption("Department/team comparisons are unavailable because the uploaded workbook has no department field.")
+
+    st.subheader("Action queue")
+    actions = build_action_queue(daily, payroll)
+    if actions.empty:
+        st.success("No payroll actions are pending.")
+    else:
+        st.dataframe(actions, use_container_width=True, hide_index=True)
 
 with overview:
     total_payable = payroll["Payable Salary"].sum()
@@ -116,4 +249,3 @@ with payslips:
     slip = create_payslip(employee_summary, pay_period)
     safe_id = employee_id.replace("/", "-")
     st.download_button("Download PDF salary slip", slip, f"payslip_{safe_id}.pdf", "application/pdf")
-
